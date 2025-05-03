@@ -8,6 +8,7 @@ import time
 import os
 from werkzeug.utils import secure_filename
 import logging
+from ultralytics import YOLO
 
 app = Flask(__name__)
 CORS(app)
@@ -15,6 +16,7 @@ CORS(app)
 # Configure upload folder
 UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'outputs'
+MODEL_PATH = 'best.pt'
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'mp4'}
 
 # Create directories if they don't exist
@@ -29,6 +31,9 @@ FRAME_HEIGHT = 480
 
 # Initialize OCR Reader
 reader = easyocr.Reader(['en'], gpu=USE_GPU, model_storage_directory='./models')
+model = YOLO(MODEL_PATH)
+names = model.names
+
 
 # Regex Patterns
 aadhaar_patterns = [
@@ -85,60 +90,47 @@ def process_image(image_path):
     return output_path
 
 def process_video(video_path):
-    # Initialize Components
     vid = cv2.VideoCapture(video_path)
     if not vid.isOpened():
-        return None
+        raise IOError(f"Cannot open video: {video_path}")
 
     output_path = os.path.join(OUTPUT_FOLDER, 'masked_' + os.path.basename(video_path))
-    
+    vid.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    vid.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    fps = vid.get(cv2.CAP_PROP_FPS)
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'avc1'), fps, (FRAME_WIDTH, FRAME_HEIGHT))
+
     frame_count = 0
     trackers = []
 
-    vid.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    vid.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    fps = vid.get(cv2.CAP_PROP_FPS)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (FRAME_WIDTH, FRAME_HEIGHT))
-
     def detect_sensitive_info(frame):
         nonlocal trackers
-
         results = reader.readtext(frame, detail=1, paragraph=False,
-                                min_size=10, text_threshold=0.5,
-                                link_threshold=0.3, low_text=0.3)
-
+                                  min_size=10, text_threshold=0.5,
+                                  link_threshold=0.3, low_text=0.3)
         detected_trackers = []
-
         for (bbox, text, conf) in results:
             if conf < CONFIDENCE_THRESHOLD:
                 continue
-
             text = text.strip().upper()
             aadhaar_text = text.replace('O', '0')
-
             aadhaar_match = any(re.search(pattern, aadhaar_text) for pattern in aadhaar_patterns)
             pan_match = re.search(pan_pattern, text)
-
             if aadhaar_match or pan_match:
                 (tl, tr, br, bl) = bbox
                 tl = tuple(map(int, tl))
                 br = tuple(map(int, br))
                 width = br[0] - tl[0]
                 height = br[1] - tl[1]
-
                 padding = 5
                 x = max(0, tl[0] - padding)
                 y = max(0, tl[1] - padding)
                 w = min(FRAME_WIDTH - x, width + padding * 2)
                 h = min(FRAME_HEIGHT - y, height + padding * 2)
-
                 rect = (x, y, w, h)
                 tracker = cv2.TrackerCSRT_create()
                 tracker.init(frame, rect)
                 detected_trackers.append(tracker)
-
         if detected_trackers:
             trackers.clear()
             trackers.extend(detected_trackers)
@@ -147,15 +139,26 @@ def process_video(video_path):
         ret, frame = vid.read()
         if not ret:
             break
-
         frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
         display_frame = frame.copy()
-
-        if frame_count % 10 == 0:  # Process every 10th frame
+        # OCR every N frames
+        if frame_count % 10 == 0:
             detect_sensitive_info(frame)
-
-        frame_count += 1
-
+        # QR Code Detection with YOLO
+        results = model(frame)[0]
+        qr_candidates = []
+        for box in results.boxes:
+            conf = float(box.conf[0])
+            class_id = int(box.cls[0])
+            label = names[class_id]
+            if conf >= CONFIDENCE_THRESHOLD and label.lower() == 'qr':
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                qr_candidates.append((x1, y1, x2, y2))
+        if qr_candidates:
+            qr_candidates.sort(key=lambda b: (b[1], -b[2]))
+            x1, y1, x2, y2 = qr_candidates[0]
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        # Mask Aadhaar/PAN regions
         new_trackers = []
         for tracker in trackers:
             success, bbox = tracker.update(frame)
@@ -167,10 +170,9 @@ def process_video(video_path):
                 h = min(FRAME_HEIGHT - y, h)
                 cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 0), -1)
                 new_trackers.append(tracker)
-
         trackers = new_trackers
         out.write(display_frame)
-
+        frame_count += 1
     vid.release()
     out.release()
     return output_path
