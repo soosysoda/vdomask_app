@@ -1,2 +1,2 @@
 [pkgs]
-apt = ["libgl1-mesa-glx"]
+apt = ["libgl1-mesa-glx", "ffmpeg", "build-essential"]
