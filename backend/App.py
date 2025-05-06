@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import cv2
 import easyocr
@@ -11,7 +11,15 @@ import logging
 from ultralytics import YOLO
 
 app = Flask(__name__)
-CORS(app)
+CORS(app) 
+
+@app.route('/')
+def serve_frontend():
+    return send_from_directory('static', 'index.html')
+
+@app.route('/static/<path:path>')
+def serve_static(path):
+    return send_from_directory('static', path)
 
 # Configure upload folder
 UPLOAD_FOLDER = 'uploads'
